@@ -1,0 +1,9 @@
+{
+  "viewreport": {
+    "author": "WorkBuddy",
+    "description": "昨日观影报告：电影+剧集合并、全账号汇总总榜长图，可附按账号分节文字榜单。需 Emby 安装 Playback Reporting；图片模式需公网可访问的 MP 域名。",
+    "name": "观影报告推送",
+    "version": "2.0.3",
+    "v2": true
+  }
+}
