@@ -44,7 +44,7 @@ class ViewReport(_PluginBase):
     plugin_name = "观影报告推送"
     plugin_desc = "文字按 Emby 账号分节；图片为所有账号汇总的总榜（电影+剧集合并）。默认纯文字，可选单张长图（点击直接打开原图，渠道内可直接显示）。需 Emby 安装 Playback Reporting 插件。"
     plugin_icon = "Pydiocells_A.png"
-    plugin_version = "2.0.8"
+    plugin_version = "2.0.9"
     plugin_author = "WorkBuddy"
     author_url = "https://github.com/"
     plugin_config_prefix = "viewreport_"
@@ -1253,9 +1253,9 @@ class ViewReport(_PluginBase):
                 if sid:
                     cover_id = sid
             ok, data = (self.primary(cover_id) if cover_id else (False, None))
-            # 兜底：历史 ItemId 失效（取图失败）时按片名反查现存 Series
+            # 兜底：历史 ItemId 失效（取图失败）时按片名反查现存条目
             if (not ok or not data) and name:
-                sid2 = self._search_series_id(name)
+                sid2 = self._search_series_id(name, item_type)
                 if sid2 and sid2 != cover_id:
                     ok, data = self.primary(sid2)
             if not ok or not data:
@@ -1521,20 +1521,21 @@ class ViewReport(_PluginBase):
             return False, "Emby 服务器连接失败!"
 
     @cache.memoize(ttl=3600)
-    def _search_series_id(self, name: str):
-        """按片名反查 Emby 现存的 Series id。
+    def _search_series_id(self, name: str, item_type: str = None):
+        """按片名反查 Emby 现存的 Item id（Series 或 Movie）。
 
-        Playback Reporting 记录的历史 ItemId 在剧集删档/换源后会失效（取图 500、
-        查不到 SeriesId）。用片名搜当前库里的 Series 可拿到有效 id 再取封面。
-        带 token 的 Items 搜索接口在无 api_key 时也可经媒体服务器凭据访问。
+        Playback Reporting 记录的历史 ItemId 在删档/换源后会失效（取图 500、
+        查不到 SeriesId）。用片名搜当前库里现存的条目可拿到有效 id 再取封面。
         """
         if not name or not self._EMBY_HOST:
             return None
         try:
             from urllib.parse import quote
             qs = quote(str(name))
+            # 剧集搜 Series、电影搜 Movie，缩小范围避免同名干扰
+            itype = "Movie" if str(item_type) == "Movie" else "Series"
             url = (f"{self._EMBY_HOST}emby/Items?searchTerm={qs}"
-                   f"&IncludeItemTypes=Series&Recursive=true&Limit=5"
+                   f"&IncludeItemTypes={itype}&Recursive=true&Limit=5"
                    f"&Fields=PrimaryImageTag,ImageTags&api_key={self._EMBY_APIKEY}")
             resp = RequestUtils().get_res(url=url)
             if resp.status_code not in (200, 204):
