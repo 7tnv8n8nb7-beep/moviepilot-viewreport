@@ -44,7 +44,7 @@ class ViewReport(_PluginBase):
     plugin_name = "观影报告推送"
     plugin_desc = "文字按 Emby 账号分节；图片为所有账号汇总的总榜（电影+剧集合并）。默认纯文字，可选单张长图（点击直接打开原图，渠道内可直接显示）。需 Emby 安装 Playback Reporting 插件。"
     plugin_icon = "Pydiocells_A.png"
-    plugin_version = "2.0.6"
+    plugin_version = "2.0.7"
     plugin_author = "WorkBuddy"
     author_url = "https://github.com/"
     plugin_config_prefix = "viewreport_"
@@ -734,34 +734,26 @@ class ViewReport(_PluginBase):
         return public_url
 
     @staticmethod
-    def _split_text(text: str, limit: int = 400, char_limit: int = 200) -> list:
-        """按渠道文本上限拆分长报告；未超限返回单条（保持原行为）。
+    def _blen(s: str) -> int:
+        return len(s.encode("utf-8"))
 
-        实测：某渠道单条在 529 字节 / 280 字符后即被截断（第 10 条起丢失），
-        远低于常规 2048 字节。故按 UTF-8 字节 400 + 字符 200 双上限收紧，
-        留约 25% 余量。优先在「账号分节 / 条目」边界断开，每条都带日期头与
-        落款，多条时标注 (i/n)；单条时不加任何标记。
+    def _build_atoms(self, text: str):
+        """把报告解析为 (header, footer, atoms)，atoms 每项为不可再拆的块。
+
+        「账号标题 / 榜单标题」暂存为前缀附给紧随的第一条影片；「小计」并入
+        前一条影片——保证标题不落单、账号信息不被拆散。
         """
         if not text:
-            return []
-
-        def blen(s: str) -> int:
-            return len(s.encode("utf-8"))
-
-        if blen(text) <= limit and len(text) <= char_limit:
-            return [text]
+            return None
         lines = text.split("\n")
         tail = max((i for i, l in enumerate(lines)
                     if "MoviePilot" in l and "生成" in l), default=-1)
         footer = lines[tail].strip() if tail >= 0 else ""
         content = lines[:tail] if tail >= 0 else lines[:]
         if not content:
-            return [text]
+            return None
         header = content[0]
-        # 拆成原子块：把「账号标题 / 榜单标题」暂存为前缀，附给紧随的第一条影片，
-        # 「小计」并入最后一条影片——保证标题行与条目不落单、账号信息不被拆散。
-        atoms = []
-        pending = []
+        atoms, pending = [], []
         i = 1
         while i < len(content):
             ln = content[i]
@@ -788,15 +780,30 @@ class ViewReport(_PluginBase):
             atoms.append(pending + [ln])
             pending = []
             i += 1
-        if pending:  # 极端情况：末尾只剩标题，并入最后一条
-            if atoms:
-                atoms[-1] = atoms[-1] + pending
-        # 预留头尾与页码的预算（字节 + 字符双约束，取更严格者）
-        budget = max(150, limit - blen(header) - blen(footer) - 40)
+        if pending and atoms:
+            atoms[-1] = atoms[-1] + pending
+        return header, footer, atoms
+
+    @staticmethod
+    def _fmt_part(header: str, footer: str, chunk: list, n: int, total: int) -> str:
+        return (f"{header}（{n}/{total}）\n\n" + "\n".join(chunk)
+                + ("\n\n" + footer if footer else ""))
+
+    def _split_text(self, text: str, limit: int = 400, char_limit: int = 200) -> list:
+        """无图分支：按渠道上限拆成多条；未超限返回单条（原样、不加页码）。"""
+        if not text:
+            return []
+        if self._blen(text) <= limit and len(text) <= char_limit:
+            return [text]
+        built = self._build_atoms(text)
+        if not built:
+            return [text]
+        header, footer, atoms = built
+        budget = max(150, limit - self._blen(header) - self._blen(footer) - 40)
         char_budget = max(80, char_limit - len(header) - len(footer) - 20)
         chunks, cur, cur_len, cur_chars = [], [], 0, 0
         for atom in atoms:
-            al = blen("\n".join(atom)) + 1
+            al = self._blen("\n".join(atom)) + 1
             acl = len("\n".join(atom)) + 1
             if cur and (cur_len + al > budget or cur_chars + acl > char_budget):
                 chunks.append(cur)
@@ -806,25 +813,56 @@ class ViewReport(_PluginBase):
             cur_chars += acl
         if cur:
             chunks.append(cur)
-        total = len(chunks)
-        if total <= 1:
+        if len(chunks) <= 1:
             return [text]
-        out = []
-        for n, ch in enumerate(chunks, 1):
-            out.append(f"{header}（{n}/{total}）\n\n" + "\n".join(ch)
-                       + ("\n\n" + footer if footer else ""))
-        return out
+        total = len(chunks)
+        return [self._fmt_part(header, footer, ch, n, total)
+                for n, ch in enumerate(chunks, 1)]
+
+    def _split_image_text(self, text: str, limit: int = 400,
+                          char_limit: int = 200) -> list:
+        """带图分支：首条按图片 caption 上限给一段（带图），其余全部合并为
+        1 条纯文字（纯文字渠道上限更高）。返回 [首条, 其余]；未超限时单条。
+        """
+        if not text:
+            return []
+        built = self._build_atoms(text)
+        if not built:
+            return [text]
+        header, footer, atoms = built
+        if self._blen(text) <= limit and len(text) <= char_limit:
+            return [text]
+        budget = max(150, limit - self._blen(header) - self._blen(footer) - 40)
+        char_budget = max(80, char_limit - len(header) - len(footer) - 20)
+        first, used, used_chars = [], 0, 0
+        for atom in atoms:
+            al = self._blen("\n".join(atom)) + 1
+            acl = len("\n".join(atom)) + 1
+            if first and (used + al > budget or used_chars + acl > char_budget):
+                break
+            first.append(atom)
+            used += al
+            used_chars += acl
+        rest = [ln for atom in atoms[len(first):] for ln in atom]
+        if not rest:
+            return [text]
+        part1 = self._fmt_part(header, footer, [ln for a in first for ln in a], 1, 2)
+        part2 = self._fmt_part(header, footer, rest, 2, 2)
+        return [part1, part2]
 
     def _send_text(self, title: str, mtype, text: str,
                    image: str = None, link: str = None) -> int:
-        """超限时拆成多条投递；未超限只发一条。图片/链接只挂首条。"""
-        parts = self._split_text(text)
+        """带图时：首条按 caption 上限给一段（带图），其余纯文字合并为一条；
+        无图时：按渠道上限拆成多条。未超限只发一条。图片/链接只挂首条。
+        """
+        parts = self._split_image_text(text) if image else self._split_text(text)
         for idx, part in enumerate(parts):
             self._send(title=title, mtype=mtype, text=part,
                        image=image if idx == 0 else None,
                        link=link if idx == 0 else None)
         if len(parts) > 1:
-            logger.info(f"文字报告超过渠道上限，已拆成 {len(parts)} 条发送")
+            logger.info(f"文字报告超过渠道上限，已拆成 {len(parts)} 条发送"
+                        f"（{'首条带图' if image else '纯文字'}）")
         return len(parts)
 
     def _send(self, title: str, mtype, text: str = None,
