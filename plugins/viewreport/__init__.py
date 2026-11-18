@@ -44,7 +44,7 @@ class ViewReport(_PluginBase):
     plugin_name = "观影报告推送"
     plugin_desc = "文字按 Emby 账号分节；图片为所有账号汇总的总榜（电影+剧集合并）。默认纯文字，可选单张长图（点击直接打开原图，渠道内可直接显示）。需 Emby 安装 Playback Reporting 插件。"
     plugin_icon = "Pydiocells_A.png"
-    plugin_version = "2.0.5"
+    plugin_version = "2.0.6"
     plugin_author = "WorkBuddy"
     author_url = "https://github.com/"
     plugin_config_prefix = "viewreport_"
@@ -734,13 +734,13 @@ class ViewReport(_PluginBase):
         return public_url
 
     @staticmethod
-    def _split_text(text: str, limit: int = 800) -> list:
+    def _split_text(text: str, limit: int = 400, char_limit: int = 200) -> list:
         """按渠道文本上限拆分长报告；未超限返回单条（保持原行为）。
 
-        图片消息的 caption / 图文描述字段上限远低于纯文本（微信图文描述、
-        Telegram 图片 caption 约 1024 字符），超限时末尾账号会被渠道砍掉。
-        这里按 UTF-8 字节计、保守取 800，优先在「账号分节 / 条目」边界断开，
-        每条都带日期头与落款，多条时标注 (i/n)；单条时不加任何标记。
+        实测：某渠道单条在 529 字节 / 280 字符后即被截断（第 10 条起丢失），
+        远低于常规 2048 字节。故按 UTF-8 字节 400 + 字符 200 双上限收紧，
+        留约 25% 余量。优先在「账号分节 / 条目」边界断开，每条都带日期头与
+        落款，多条时标注 (i/n)；单条时不加任何标记。
         """
         if not text:
             return []
@@ -748,7 +748,7 @@ class ViewReport(_PluginBase):
         def blen(s: str) -> int:
             return len(s.encode("utf-8"))
 
-        if blen(text) <= limit:
+        if blen(text) <= limit and len(text) <= char_limit:
             return [text]
         lines = text.split("\n")
         tail = max((i for i, l in enumerate(lines)
@@ -791,16 +791,19 @@ class ViewReport(_PluginBase):
         if pending:  # 极端情况：末尾只剩标题，并入最后一条
             if atoms:
                 atoms[-1] = atoms[-1] + pending
-        # 预留头尾与页码的字节预算
-        budget = max(200, limit - blen(header) - blen(footer) - 40)
-        chunks, cur, cur_len = [], [], 0
+        # 预留头尾与页码的预算（字节 + 字符双约束，取更严格者）
+        budget = max(150, limit - blen(header) - blen(footer) - 40)
+        char_budget = max(80, char_limit - len(header) - len(footer) - 20)
+        chunks, cur, cur_len, cur_chars = [], [], 0, 0
         for atom in atoms:
             al = blen("\n".join(atom)) + 1
-            if cur and cur_len + al > budget:
+            acl = len("\n".join(atom)) + 1
+            if cur and (cur_len + al > budget or cur_chars + acl > char_budget):
                 chunks.append(cur)
-                cur, cur_len = [], 0
+                cur, cur_len, cur_chars = [], 0, 0
             cur.extend(atom)
             cur_len += al
+            cur_chars += acl
         if cur:
             chunks.append(cur)
         total = len(chunks)
