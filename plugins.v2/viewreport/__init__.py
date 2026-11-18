@@ -44,7 +44,7 @@ class ViewReport(_PluginBase):
     plugin_name = "观影报告推送"
     plugin_desc = "文字按 Emby 账号分节；图片为所有账号汇总的总榜（电影+剧集合并）。默认纯文字，可选单张长图（点击直接打开原图，渠道内可直接显示）。需 Emby 安装 Playback Reporting 插件。"
     plugin_icon = "Pydiocells_A.png"
-    plugin_version = "2.0.7"
+    plugin_version = "2.0.8"
     plugin_author = "WorkBuddy"
     author_url = "https://github.com/"
     plugin_config_prefix = "viewreport_"
@@ -961,7 +961,8 @@ class ViewReport(_PluginBase):
             hero = None
             if top:
                 try:
-                    hero = self._cover(top[0][0], top[0][1], top[0][2], W, H, 0)
+                    hero = self._cover(top[0][0], top[0][1], top[0][2], W, H, 0,
+                                       name=top[0][3] if len(top[0]) > 3 else None)
                 except Exception:
                     hero = None
             if hero is not None:
@@ -1071,8 +1072,8 @@ class ViewReport(_PluginBase):
                 return draw_rich(cx, cy - offset, text, f_text, f_digit,
                                  fill_text, fill_digit, anchor="mm", sp=sp)
 
-            def cover_rgba(uid, iid, itype, w, h, r):
-                cov = self._cover(uid, iid, itype, w, h, r)
+            def cover_rgba(uid, iid, itype, w, h, r, nm=None):
+                cov = self._cover(uid, iid, itype, w, h, r, name=nm)
                 if cov is None:
                     return None
                 img = cov.convert("RGBA")
@@ -1116,7 +1117,7 @@ class ViewReport(_PluginBase):
                     x = x0 + j * (card_w + gap)
                     glass([x - 5, y - 5, x + card_w + 5, y + card_h],
                           radius=14, tint=(255, 255, 255, 30), blur=14, edge=(255, 255, 255, 58))
-                    cov = cover_rgba(uid, iid, itype, card_w, poster_h, 9)
+                    cov = cover_rgba(uid, iid, itype, card_w, poster_h, 9, name)
                     if cov is not None:
                         paste_cover(cov, x, y, card_w, poster_h, 9)
                     else:
@@ -1153,7 +1154,7 @@ class ViewReport(_PluginBase):
                       tint=(255, 255, 255, 26), blur=10, edge=(196, 188, 255, 62))
                 d.text((PAD + 42, ry + 28), self._cn_rank(idx), font=F(13),
                        fill=PURPLE, anchor="mm")
-                th = cover_rgba(uid, iid, itype, 30, 45, 6)
+                th = cover_rgba(uid, iid, itype, 30, 45, 6, name)
                 if th is not None:
                     paste_cover(th, PAD + 84, ry + 7, 30, 45, 6)
                 else:
@@ -1236,17 +1237,27 @@ class ViewReport(_PluginBase):
         except Exception:
             return text[:20]
 
-    def _cover(self, user_id, item_id, item_type, w: int, h: int, radius: int):
-        """取 Emby 封面并居中裁成指定尺寸 + 圆角；取不到返回 None。"""
+    def _cover(self, user_id, item_id, item_type, w: int, h: int, radius: int,
+               name: str = None):
+        """取 Emby 封面并居中裁成指定尺寸 + 圆角；取不到返回 None。
+
+        取图链（任一成功即止）：
+          1) 原始 ItemId 直接取（电影 / 有效单集）
+          2) 历史 ItemId 失效时：查 SeriesId 再取（需 api_key）
+          3) 仍失败：按片名反查现存 Series 再取（应对删档/换源导致的失效 ItemId）
+        """
         try:
             cover_id = item_id
             if item_type and str(item_type) != "Movie":
                 sid = self._get_series_id(user_id, item_id)
                 if sid:
                     cover_id = sid
-            if not cover_id:
-                return None
-            ok, data = self.primary(cover_id)
+            ok, data = (self.primary(cover_id) if cover_id else (False, None))
+            # 兜底：历史 ItemId 失效（取图失败）时按片名反查现存 Series
+            if (not ok or not data) and name:
+                sid2 = self._search_series_id(name)
+                if sid2 and sid2 != cover_id:
+                    ok, data = self.primary(sid2)
             if not ok or not data:
                 return None
             img = Image.open(BytesIO(data)).convert("RGB")
@@ -1508,6 +1519,37 @@ class ViewReport(_PluginBase):
             return True, resp.json()
         except Exception:
             return False, "Emby 服务器连接失败!"
+
+    @cache.memoize(ttl=3600)
+    def _search_series_id(self, name: str):
+        """按片名反查 Emby 现存的 Series id。
+
+        Playback Reporting 记录的历史 ItemId 在剧集删档/换源后会失效（取图 500、
+        查不到 SeriesId）。用片名搜当前库里的 Series 可拿到有效 id 再取封面。
+        带 token 的 Items 搜索接口在无 api_key 时也可经媒体服务器凭据访问。
+        """
+        if not name or not self._EMBY_HOST:
+            return None
+        try:
+            from urllib.parse import quote
+            qs = quote(str(name))
+            url = (f"{self._EMBY_HOST}emby/Items?searchTerm={qs}"
+                   f"&IncludeItemTypes=Series&Recursive=true&Limit=5"
+                   f"&Fields=PrimaryImageTag,ImageTags&api_key={self._EMBY_APIKEY}")
+            resp = RequestUtils().get_res(url=url)
+            if resp.status_code not in (200, 204):
+                return None
+            items = resp.json().get("Items", []) or []
+            # 优先精确匹配片名，其次首个有 Primary 封面的结果
+            for it in items:
+                if str(it.get("Name", "")) == str(name):
+                    return it.get("Id")
+            for it in items:
+                if (it.get("ImageTags") or {}).get("Primary"):
+                    return it.get("Id")
+            return items[0].get("Id") if items else None
+        except Exception:
+            return None
 
     def get_report(self, days, types=None, user_id=None, limit=10):
         if not types:
