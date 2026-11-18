@@ -44,7 +44,7 @@ class ViewReport(_PluginBase):
     plugin_name = "观影报告推送"
     plugin_desc = "文字按 Emby 账号分节；图片为所有账号汇总的总榜（电影+剧集合并）。默认纯文字，可选单张长图（点击直接打开原图，渠道内可直接显示）。需 Emby 安装 Playback Reporting 插件。"
     plugin_icon = "Pydiocells_A.png"
-    plugin_version = "2.0.4"
+    plugin_version = "2.0.5"
     plugin_author = "WorkBuddy"
     author_url = "https://github.com/"
     plugin_config_prefix = "viewreport_"
@@ -424,8 +424,9 @@ class ViewReport(_PluginBase):
                 if fmt == "text":
                     text = self._make_text_report(emby_name, date_str, groups_full)
                     if text:
-                        self._send(title=msg_title, mtype=mtype, text=text)
-                        logger.info(f"{emby_name} 文字观影报告推送成功")
+                        n_parts = self._send_text(title=msg_title, mtype=mtype, text=text)
+                        logger.info(f"{emby_name} 文字观影报告推送成功"
+                                    + (f"（{n_parts} 条）" if n_parts > 1 else ""))
                         logger.info("文字报告内容：\n" + text)
                     else:
                         logger.error(f"{emby_name} 文字观影报告生成失败")
@@ -460,9 +461,11 @@ class ViewReport(_PluginBase):
                 if caption:
                     logger.info("文字报告内容：\n" + caption)
                 # link 指向图片本身：点击直接打开原图，不再跳 MoviePilot 插件页
-                self._send(title=msg_title, mtype=mtype, text=caption,
-                           image=image_url, link=public_url)
-                logger.info(f"{emby_name} 汇总总榜推送成功 image={image_url} link={public_url}")
+                # 文字超限时自动拆多条；图片/链接只挂首条，避免重复发图
+                n_parts = self._send_text(title=msg_title, mtype=mtype, text=caption,
+                                          image=image_url, link=public_url)
+                logger.info(f"{emby_name} 汇总总榜推送成功 image={image_url} link={public_url}"
+                            + (f" 文字{n_parts}条" if n_parts > 1 else ""))
 
         except Exception as e:
             logger.error(f"观影报告推送执行异常：{e}")
@@ -729,6 +732,97 @@ class ViewReport(_PluginBase):
         if local_path:
             self._prime_image_cache(public_url, local_path)
         return public_url
+
+    @staticmethod
+    def _split_text(text: str, limit: int = 800) -> list:
+        """按渠道文本上限拆分长报告；未超限返回单条（保持原行为）。
+
+        图片消息的 caption / 图文描述字段上限远低于纯文本（微信图文描述、
+        Telegram 图片 caption 约 1024 字符），超限时末尾账号会被渠道砍掉。
+        这里按 UTF-8 字节计、保守取 800，优先在「账号分节 / 条目」边界断开，
+        每条都带日期头与落款，多条时标注 (i/n)；单条时不加任何标记。
+        """
+        if not text:
+            return []
+
+        def blen(s: str) -> int:
+            return len(s.encode("utf-8"))
+
+        if blen(text) <= limit:
+            return [text]
+        lines = text.split("\n")
+        tail = max((i for i, l in enumerate(lines)
+                    if "MoviePilot" in l and "生成" in l), default=-1)
+        footer = lines[tail].strip() if tail >= 0 else ""
+        content = lines[:tail] if tail >= 0 else lines[:]
+        if not content:
+            return [text]
+        header = content[0]
+        # 拆成原子块：把「账号标题 / 榜单标题」暂存为前缀，附给紧随的第一条影片，
+        # 「小计」并入最后一条影片——保证标题行与条目不落单、账号信息不被拆散。
+        atoms = []
+        pending = []
+        i = 1
+        while i < len(content):
+            ln = content[i]
+            if not ln.strip():
+                i += 1
+                continue
+            if ln.startswith("──") or ln.startswith("🏆"):
+                pending.append(ln)
+                i += 1
+                continue
+            if ln.strip()[:1].isdigit() and "." in ln:
+                grp = pending + [ln]
+                pending = []
+                if i + 1 < len(content) and content[i + 1].startswith("  "):
+                    grp.append(content[i + 1])
+                    i += 1
+                atoms.append(grp)
+                i += 1
+                continue
+            if "小计" in ln and atoms:
+                atoms[-1] = atoms[-1] + [ln]
+                i += 1
+                continue
+            atoms.append(pending + [ln])
+            pending = []
+            i += 1
+        if pending:  # 极端情况：末尾只剩标题，并入最后一条
+            if atoms:
+                atoms[-1] = atoms[-1] + pending
+        # 预留头尾与页码的字节预算
+        budget = max(200, limit - blen(header) - blen(footer) - 40)
+        chunks, cur, cur_len = [], [], 0
+        for atom in atoms:
+            al = blen("\n".join(atom)) + 1
+            if cur and cur_len + al > budget:
+                chunks.append(cur)
+                cur, cur_len = [], 0
+            cur.extend(atom)
+            cur_len += al
+        if cur:
+            chunks.append(cur)
+        total = len(chunks)
+        if total <= 1:
+            return [text]
+        out = []
+        for n, ch in enumerate(chunks, 1):
+            out.append(f"{header}（{n}/{total}）\n\n" + "\n".join(ch)
+                       + ("\n\n" + footer if footer else ""))
+        return out
+
+    def _send_text(self, title: str, mtype, text: str,
+                   image: str = None, link: str = None) -> int:
+        """超限时拆成多条投递；未超限只发一条。图片/链接只挂首条。"""
+        parts = self._split_text(text)
+        for idx, part in enumerate(parts):
+            self._send(title=title, mtype=mtype, text=part,
+                       image=image if idx == 0 else None,
+                       link=link if idx == 0 else None)
+        if len(parts) > 1:
+            logger.info(f"文字报告超过渠道上限，已拆成 {len(parts)} 条发送")
+        return len(parts)
 
     def _send(self, title: str, mtype, text: str = None,
               image: str = None, link: str = None):
