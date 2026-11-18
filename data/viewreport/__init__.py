@@ -44,7 +44,7 @@ class ViewReport(_PluginBase):
     plugin_name = "观影报告推送"
     plugin_desc = "文字按 Emby 账号分节；图片为所有账号汇总的总榜（电影+剧集合并）。默认纯文字，可选单张长图（点击直接打开原图，渠道内可直接显示）。需 Emby 安装 Playback Reporting 插件。"
     plugin_icon = "Pydiocells_A.png"
-    plugin_version = "2.0.3"
+    plugin_version = "2.0.4"
     plugin_author = "WorkBuddy"
     author_url = "https://github.com/"
     plugin_config_prefix = "viewreport_"
@@ -405,8 +405,11 @@ class ViewReport(_PluginBase):
                 #   both  -> 同一条消息里：汇总总榜图片 + 按账号分节的完整文字
                 want_image = fmt in ("image", "both")
 
-                # 按 Emby 账号归类（文字报告用）；无观影记录的账号不会出现
+                # 按 Emby 账号归类；无观影记录的账号不会出现
                 user_names = self._get_emby_users()
+                # 文字报告：完整榜单，不截断（limit=None 取全部条目）
+                groups_full = self._group_by_user(movies, tvshows, user_names, None)
+                # 图片总榜：维持现状，各账号仍取 Top N
                 groups = self._group_by_user(movies, tvshows, user_names, int(self._cnt))
                 if not groups:
                     logger.info(f"{emby_name} 无观影数据，跳过推送")
@@ -419,7 +422,7 @@ class ViewReport(_PluginBase):
 
                 # 纯文字报告：整台服务器一条消息，内部按账号分节；正文不含标题（避免与消息标题重复）
                 if fmt == "text":
-                    text = self._make_text_report(emby_name, date_str, groups)
+                    text = self._make_text_report(emby_name, date_str, groups_full)
                     if text:
                         self._send(title=msg_title, mtype=mtype, text=text)
                         logger.info(f"{emby_name} 文字观影报告推送成功")
@@ -450,7 +453,7 @@ class ViewReport(_PluginBase):
                 image_url = self._pick_image_url(filename, ts, public_url, path)
                 # 文字保持现状：按账号分节的完整榜单（both 时去掉与标题重复的汇总行）
                 if fmt == "both":
-                    caption = self._make_text_report(emby_name, date_str, groups,
+                    caption = self._make_text_report(emby_name, date_str, groups_full,
                                                      show_count=False)
                 else:
                     caption = f"共 {len(all_items)} 部作品\n{date_str}"
@@ -499,8 +502,7 @@ class ViewReport(_PluginBase):
                     except Exception:
                         name, count, duration = str(it), 0, 0
                     name = " ".join(str(name or "未知").split())
-                    if len(name) > 48:
-                        name = name[:47] + "…"
+                    # 完整显示片名，不再截断加省略号（用户要求文字报告不省略）
                     try:
                         count = int(count or 0)
                     except Exception:
@@ -570,11 +572,13 @@ class ViewReport(_PluginBase):
         return {}
 
     @staticmethod
-    def _group_by_user(movies: list, tvshows: list, user_names: dict, limit: int) -> list:
-        """按 UserId 分组；电影与剧集合并成一份统一榜单，各账号取 Top limit。
+    def _group_by_user(movies: list, tvshows: list, user_names: dict, limit: int = None) -> list:
+        """按 UserId 分组；电影与剧集合并成一份统一榜单。
 
         合并后按播放总时长降序统一排名，不再分别生成「电影榜 / 剧集榜」。
         没有任何观影记录的账号不会出现。
+        limit 为 None 时不截断（取全部条目，供完整文字报告使用）；
+        传具体数字时各账号取 Top limit（供图片总榜使用，保持现状）。
         """
         groups = {}
 
@@ -596,7 +600,9 @@ class ViewReport(_PluginBase):
         feed(tvshows)
         out = []
         for uid, grp in groups.items():
-            items = sorted(grp["items"], key=dur, reverse=True)[:max(1, limit)]
+            items = sorted(grp["items"], key=dur, reverse=True)
+            if limit is not None:
+                items = items[:max(1, int(limit))]
             if not items:
                 continue
             grp["items"] = items
